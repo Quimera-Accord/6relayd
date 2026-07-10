@@ -12,35 +12,30 @@
  *
  */
 
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <errno.h>
 
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <net/ethernet.h>
-#include <netinet/ip6.h>
 #include <netinet/icmp6.h>
+#include <netinet/ip6.h>
 #include <netpacket/packet.h>
+#include <sys/socket.h>
 
-#include <linux/rtnetlink.h>
-#include <linux/filter.h>
-#include "router.h"
 #include "ndp.h"
-
+#include "router.h"
+#include <linux/filter.h>
+#include <linux/rtnetlink.h>
 
 static const struct relayd_config *config = NULL;
 
-static void handle_solicit(void *addr, void *data, size_t len,
-		struct relayd_interface *iface);
-static void handle_rtnetlink(void *addr, void *data, size_t len,
-		struct relayd_interface *iface);
-static struct ndp_neighbor* find_neighbor(struct in6_addr *addr, bool strict);
-static void modify_neighbor(struct in6_addr *addr, struct relayd_interface *iface,
-		bool add);
-static ssize_t ping6(struct in6_addr *addr,
-		const struct relayd_interface *iface);
+static void handle_solicit(void *addr, void *data, size_t len, struct relayd_interface *iface);
+static void handle_rtnetlink(void *addr, void *data, size_t len, struct relayd_interface *iface);
+static struct ndp_neighbor *find_neighbor(struct in6_addr *addr, bool strict);
+static void modify_neighbor(struct in6_addr *addr, struct relayd_interface *iface, bool add);
+static ssize_t ping6(struct in6_addr *addr, const struct relayd_interface *iface);
 
 static struct list_head neighbors = LIST_HEAD_INIT(neighbors);
 static size_t neighbor_count = 0;
@@ -50,23 +45,19 @@ static int ping_socket = -1;
 static struct relayd_event ndp_event_solicit = {-1, NULL, handle_solicit};
 static struct relayd_event rtnl_event = {-1, NULL, handle_rtnetlink};
 
-
 // Filter ICMPv6 messages of type neighbor soliciation
 static struct sock_filter bpf[] = {
 	BPF_STMT(BPF_LD | BPF_B | BPF_ABS, offsetof(struct ip6_hdr, ip6_nxt)),
 	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_ICMPV6, 0, 3),
-	BPF_STMT(BPF_LD | BPF_B | BPF_ABS, sizeof(struct ip6_hdr) +
-			offsetof(struct icmp6_hdr, icmp6_type)),
+	BPF_STMT(BPF_LD | BPF_B | BPF_ABS, sizeof(struct ip6_hdr) + offsetof(struct icmp6_hdr, icmp6_type)),
 	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ND_NEIGHBOR_SOLICIT, 0, 1),
 	BPF_STMT(BPF_RET | BPF_K, 0xffffffff),
 	BPF_STMT(BPF_RET | BPF_K, 0),
 };
 static const struct sock_fprog bpf_prog = {sizeof(bpf) / sizeof(*bpf), bpf};
 
-
 // Initialize NDP-proxy
-int init_ndp_proxy(const struct relayd_config *relayd_config)
-{
+int init_ndp_proxy(const struct relayd_config *relayd_config) {
 	config = relayd_config;
 	if (config->slavecount < 1)
 		return 0;
@@ -77,26 +68,18 @@ int init_ndp_proxy(const struct relayd_config *relayd_config)
 
 	// Receive netlink neighbor and ip-address events
 	uint32_t group = RTNLGRP_IPV6_IFADDR;
-	setsockopt(rtnl_event.socket, SOL_NETLINK,
-			NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
+	setsockopt(rtnl_event.socket, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
 	group = RTNLGRP_IPV6_ROUTE;
-	setsockopt(rtnl_event.socket, SOL_NETLINK,
-			NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
+	setsockopt(rtnl_event.socket, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
 
 	// Synthesize initial address events
 	struct {
 		struct nlmsghdr nh;
 		struct ifaddrmsg ifa;
-	} req2 = {
-		{sizeof(req2), RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP,
-				++rtnl_seqid, 0},
-		{.ifa_family = AF_INET6}
-	};
+	} req2 = {{sizeof(req2), RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, ++rtnl_seqid, 0}, {.ifa_family = AF_INET6}};
 	send(rtnl_event.socket, &req2, sizeof(req2), MSG_DONTWAIT);
 
 	relayd_register_event(&rtnl_event);
-
-
 
 	// Test if disabled
 	if (!config->enable_ndp_relay || config->slavecount < 1)
@@ -109,9 +92,8 @@ int init_ndp_proxy(const struct relayd_config *relayd_config)
 		char ipbuf[INET6_ADDRSTRLEN];
 		char iface[16];
 
-		if (sscanf(config->static_ndp[i], "%45s/%hhu:%15s", ipbuf, &n->len, iface) < 3
-				|| n->len > 128 || inet_pton(AF_INET6, ipbuf, &n->addr) != 1 ||
-				!(n->iface = relayd_get_interface_by_name(iface))) {
+		if (sscanf(config->static_ndp[i], "%45s/%hhu:%15s", ipbuf, &n->len, iface) < 3 || n->len > 128 || inet_pton(AF_INET6, ipbuf, &n->addr) != 1 ||
+			!(n->iface = relayd_get_interface_by_name(iface))) {
 			syslog(LOG_ERR, "Invalid static NDP-prefix %s", config->static_ndp[i]);
 			return -1;
 		}
@@ -121,29 +103,23 @@ int init_ndp_proxy(const struct relayd_config *relayd_config)
 
 	// Create socket for intercepting NDP
 	int sock = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-			htons(ETH_P_ALL)); // ETH_P_ALL for ingress + egress
+		htons(ETH_P_ALL)); // ETH_P_ALL for ingress + egress
 	if (sock < 0) {
-		syslog(LOG_ERR, "Unable to open packet socket: %s",
-				strerror(errno));
+		syslog(LOG_ERR, "Unable to open packet socket: %s", strerror(errno));
 		return -1;
 	}
 
-	if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER,
-			&bpf_prog, sizeof(bpf_prog))) {
+	if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &bpf_prog, sizeof(bpf_prog))) {
 		syslog(LOG_ERR, "Failed to set BPF: %s", strerror(errno));
 		return -1;
 	}
 
-
-	struct packet_mreq mreq = {config->master.ifindex,
-			PACKET_MR_ALLMULTI, ETH_ALEN, {0}};
-	setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
-			&mreq, sizeof(mreq));
+	struct packet_mreq mreq = {config->master.ifindex, PACKET_MR_ALLMULTI, ETH_ALEN, {0}};
+	setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
 	for (size_t i = 0; i < config->slavecount; ++i) {
 		mreq.mr_ifindex = config->slaves[i].ifindex;
-		setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
-				&mreq, sizeof(mreq));
+		setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 	}
 
 	ndp_event_solicit.socket = sock;
@@ -157,71 +133,52 @@ int init_ndp_proxy(const struct relayd_config *relayd_config)
 
 	// This is required by RFC 4861
 	val = 255;
-	setsockopt(ping_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
-			&val, sizeof(val));
-	setsockopt(ping_socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
-			&val, sizeof(val));
+	setsockopt(ping_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val));
+	setsockopt(ping_socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val));
 
 	// Filter all packages, we only want to send
 	struct icmp6_filter filt;
 	ICMP6_FILTER_SETBLOCKALL(&filt);
-	setsockopt(ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER,
-			&filt, sizeof(filt));
-
+	setsockopt(ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt));
 
 	// Netlink socket, continued...
 	group = RTNLGRP_NEIGH;
-	setsockopt(rtnl_event.socket, SOL_NETLINK,
-			NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
+	setsockopt(rtnl_event.socket, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
 
 	// Synthesize initial neighbor events
 	struct {
 		struct nlmsghdr nh;
 		struct ndmsg ndm;
-	} req = {
-		{sizeof(req), RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP,
-				++rtnl_seqid, 0},
-		{.ndm_family = AF_INET6}
-	};
+	} req = {{sizeof(req), RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, ++rtnl_seqid, 0}, {.ndm_family = AF_INET6}};
 	send(rtnl_event.socket, &req, sizeof(req), MSG_DONTWAIT);
 
 	return 0;
 }
 
-
 // Deinitialize NDP proxy
-void deinit_ndp_proxy()
-{
+void deinit_ndp_proxy() {
 	while (!list_empty(&neighbors)) {
-		struct ndp_neighbor *c = list_first_entry(&neighbors,
-				struct ndp_neighbor, head);
+		struct ndp_neighbor *c = list_first_entry(&neighbors, struct ndp_neighbor, head);
 		modify_neighbor(&c->addr, c->iface, false);
 	}
 }
 
-
 // Send an ICMP-ECHO. This is less for actually pinging but for the
 // neighbor cache to be kept up-to-date.
-static ssize_t ping6(struct in6_addr *addr,
-		const struct relayd_interface *iface)
-{
+static ssize_t ping6(struct in6_addr *addr, const struct relayd_interface *iface) {
 	struct sockaddr_in6 dest = {AF_INET6, 0, 0, *addr, 0};
 	struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
 	struct iovec iov = {&echo, sizeof(echo)};
 
 	// Linux seems to not honor IPV6_PKTINFO on raw-sockets, so work around
-	setsockopt(ping_socket, SOL_SOCKET, SO_BINDTODEVICE,
-			iface->ifname, sizeof(iface->ifname));
+	setsockopt(ping_socket, SOL_SOCKET, SO_BINDTODEVICE, iface->ifname, sizeof(iface->ifname));
 	return relayd_forward_packet(ping_socket, &dest, &iov, 1, iface);
 }
 
-
 // Handle solicitations
-static void handle_solicit(void *addr, void *data, size_t len,
-		struct relayd_interface *iface)
-{
+static void handle_solicit(void *addr, void *data, size_t len, struct relayd_interface *iface) {
 	struct ip6_hdr *ip6 = data;
-	struct nd_neighbor_solicit *req = (struct nd_neighbor_solicit*)&ip6[1];
+	struct nd_neighbor_solicit *req = (struct nd_neighbor_solicit *)&ip6[1];
 	struct sockaddr_ll *ll = addr;
 
 	// Solicitation is for duplicate address detection
@@ -235,9 +192,7 @@ static void handle_solicit(void *addr, void *data, size_t len,
 	if (len < sizeof(*ip6) + sizeof(*req))
 		return; // Invalid reqicitation
 
-	if (IN6_IS_ADDR_LINKLOCAL(&req->nd_ns_target) ||
-			IN6_IS_ADDR_LOOPBACK(&req->nd_ns_target) ||
-			IN6_IS_ADDR_MULTICAST(&req->nd_ns_target))
+	if (IN6_IS_ADDR_LINKLOCAL(&req->nd_ns_target) || IN6_IS_ADDR_LOOPBACK(&req->nd_ns_target) || IN6_IS_ADDR_MULTICAST(&req->nd_ns_target))
 		return; // Invalid target
 
 	char ipbuf[INET6_ADDRSTRLEN];
@@ -246,16 +201,14 @@ static void handle_solicit(void *addr, void *data, size_t len,
 
 	uint8_t mac[6];
 	relayd_get_interface_mac(iface->ifname, mac);
-	if (!memcmp(ll->sll_addr, mac, sizeof(mac)) &&
-			ll->sll_pkttype != PACKET_OUTGOING)
+	if (!memcmp(ll->sll_addr, mac, sizeof(mac)) && ll->sll_pkttype != PACKET_OUTGOING)
 		return; // Looped back
 
 	time_t now = time(NULL);
 
 	struct ndp_neighbor *n = find_neighbor(&req->nd_ns_target, false);
 	if (n && (n->iface || llabs(n->timeout - now) < 5)) {
-		syslog(LOG_NOTICE, "%s is on %s", ipbuf,
-				(n->iface) ? n->iface->ifname : "<pending>");
+		syslog(LOG_NOTICE, "%s is on %s", ipbuf, (n->iface) ? n->iface->ifname : "<pending>");
 		if (!n->iface || n->iface == iface)
 			return;
 
@@ -265,25 +218,23 @@ static void handle_solicit(void *addr, void *data, size_t len,
 			struct nd_opt_hdr opt_ll_hdr;
 			uint8_t mac[6];
 		} advert = {
-			.body = {
-				.nd_na_hdr = {ND_NEIGHBOR_ADVERT,
-					0, 0, {{0}}},
-				.nd_na_target = req->nd_ns_target,
-			},
+			.body =
+				{
+					.nd_na_hdr = {ND_NEIGHBOR_ADVERT, 0, 0, {{0}}},
+					.nd_na_target = req->nd_ns_target,
+				},
 			.opt_ll_hdr = {ND_OPT_TARGET_LINKADDR, 1},
 		};
 
 		memcpy(advert.mac, mac, sizeof(advert.mac));
-		advert.body.nd_na_flags_reserved = ND_NA_FLAG_ROUTER |
-				ND_NA_FLAG_SOLICITED;
+		advert.body.nd_na_flags_reserved = ND_NA_FLAG_ROUTER | ND_NA_FLAG_SOLICITED;
 
 		struct sockaddr_in6 dest = {AF_INET6, 0, 0, ALL_IPV6_NODES, 0};
 		if (!ns_is_dad) // If not DAD, then unicast to source
 			dest.sin6_addr = ip6->ip6_src;
 
 		// Linux seems to not honor IPV6_PKTINFO on raw-sockets, so work around
-		setsockopt(ping_socket, SOL_SOCKET, SO_BINDTODEVICE,
-					iface->ifname, sizeof(iface->ifname));
+		setsockopt(ping_socket, SOL_SOCKET, SO_BINDTODEVICE, iface->ifname, sizeof(iface->ifname));
 		struct iovec iov = {&advert, sizeof(advert)};
 		relayd_forward_packet(ping_socket, &dest, &iov, 1, iface);
 	} else {
@@ -296,20 +247,15 @@ static void handle_solicit(void *addr, void *data, size_t len,
 			sent += ping6(&req->nd_ns_target, &config->master);
 
 		for (size_t i = 0; i < config->slavecount; ++i)
-			if ((!ns_is_dad || config->slaves[i].external == false)
-					&& iface != &config->slaves[i])
-				sent += ping6(&req->nd_ns_target,
-						&config->slaves[i]);
+			if ((!ns_is_dad || config->slaves[i].external == false) && iface != &config->slaves[i])
+				sent += ping6(&req->nd_ns_target, &config->slaves[i]);
 
 		if (sent > 0) // Sent a ping, add pending neighbor entry
 			modify_neighbor(&req->nd_ns_target, NULL, true);
 	}
 }
 
-
-void relayd_setup_route(const struct in6_addr *addr, int prefixlen,
-		const struct relayd_interface *iface, const struct in6_addr *gw, bool add)
-{
+void relayd_setup_route(const struct in6_addr *addr, int prefixlen, const struct relayd_interface *iface, const struct in6_addr *gw, bool add) {
 	struct req {
 		struct nlmsghdr nh;
 		struct rtmsg rtm;
@@ -353,13 +299,10 @@ void relayd_setup_route(const struct in6_addr *addr, int prefixlen,
 }
 
 // Use rtnetlink to modify kernel routes
-static void setup_route(struct in6_addr *addr, struct relayd_interface *iface,
-		bool add)
-{
+static void setup_route(struct in6_addr *addr, struct relayd_interface *iface, bool add) {
 	char namebuf[INET6_ADDRSTRLEN];
 	inet_ntop(AF_INET6, addr, namebuf, sizeof(namebuf));
-	syslog(LOG_NOTICE, "%s about %s on %s", (add) ? "Learned" : "Forgot",
-			namebuf, (iface) ? iface->ifname : "<pending>");
+	syslog(LOG_NOTICE, "%s about %s on %s", (add) ? "Learned" : "Forgot", namebuf, (iface) ? iface->ifname : "<pending>");
 
 	if (!iface || !config->enable_route_learning)
 		return;
@@ -367,50 +310,40 @@ static void setup_route(struct in6_addr *addr, struct relayd_interface *iface,
 	relayd_setup_route(addr, 128, iface, NULL, add);
 }
 
-static void free_neighbor(struct ndp_neighbor *n)
-{
+static void free_neighbor(struct ndp_neighbor *n) {
 	setup_route(&n->addr, n->iface, false);
 	list_del(&n->head);
 	free(n);
 	--neighbor_count;
 }
 
-
-static bool match_neighbor(struct ndp_neighbor *n, struct in6_addr *addr)
-{
+static bool match_neighbor(struct ndp_neighbor *n, struct in6_addr *addr) {
 	if (n->len <= 32)
-		return ntohl(n->addr.s6_addr32[0]) >> (32 - n->len) ==
-				ntohl(addr->s6_addr32[0]) >> (32 - n->len);
+		return ntohl(n->addr.s6_addr32[0]) >> (32 - n->len) == ntohl(addr->s6_addr32[0]) >> (32 - n->len);
 
 	if (n->addr.s6_addr32[0] != addr->s6_addr32[0])
 		return false;
 
 	if (n->len <= 64)
-		return ntohl(n->addr.s6_addr32[1]) >> (64 - n->len) ==
-				ntohl(addr->s6_addr32[1]) >> (64 - n->len);
+		return ntohl(n->addr.s6_addr32[1]) >> (64 - n->len) == ntohl(addr->s6_addr32[1]) >> (64 - n->len);
 
 	if (n->addr.s6_addr32[1] != addr->s6_addr32[1])
 		return false;
 
 	if (n->len <= 96)
-		return ntohl(n->addr.s6_addr32[2]) >> (96 - n->len) ==
-				ntohl(addr->s6_addr32[2]) >> (96 - n->len);
+		return ntohl(n->addr.s6_addr32[2]) >> (96 - n->len) == ntohl(addr->s6_addr32[2]) >> (96 - n->len);
 
 	if (n->addr.s6_addr32[2] != addr->s6_addr32[2])
 		return false;
 
-	return ntohl(n->addr.s6_addr32[3]) >> (128 - n->len) ==
-			ntohl(addr->s6_addr32[3]) >> (128 - n->len);
+	return ntohl(n->addr.s6_addr32[3]) >> (128 - n->len) == ntohl(addr->s6_addr32[3]) >> (128 - n->len);
 }
 
-
-static struct ndp_neighbor* find_neighbor(struct in6_addr *addr, bool strict)
-{
+static struct ndp_neighbor *find_neighbor(struct in6_addr *addr, bool strict) {
 	time_t now = time(NULL);
 	struct ndp_neighbor *n, *e;
 	list_for_each_entry_safe(n, e, &neighbors, head) {
-		if ((!strict && match_neighbor(n, addr)) ||
-				(n->len == 128 && IN6_ARE_ADDR_EQUAL(&n->addr, addr)))
+		if ((!strict && match_neighbor(n, addr)) || (n->len == 128 && IN6_ARE_ADDR_EQUAL(&n->addr, addr)))
 			return n;
 
 		if (!n->iface && llabs(n->timeout - now) >= 5)
@@ -419,12 +352,9 @@ static struct ndp_neighbor* find_neighbor(struct in6_addr *addr, bool strict)
 	return NULL;
 }
 
-
 // Modified our own neighbor-entries
-static void modify_neighbor(struct in6_addr *addr,
-		struct relayd_interface *iface, bool add)
-{
-	if (!addr || (void*)addr == (void*)iface)
+static void modify_neighbor(struct in6_addr *addr, struct relayd_interface *iface, bool add) {
+	if (!addr || (void *)addr == (void *)iface)
 		return;
 
 	struct ndp_neighbor *n = find_neighbor(addr, true);
@@ -432,8 +362,7 @@ static void modify_neighbor(struct in6_addr *addr,
 		if (n && (!n->iface || n->iface == iface))
 			free_neighbor(n);
 	} else if (!n) { // No entry yet, add one if possible
-		if (neighbor_count >= NDP_MAX_NEIGHBORS ||
-				!(n = malloc(sizeof(*n))))
+		if (neighbor_count >= NDP_MAX_NEIGHBORS || !(n = malloc(sizeof(*n))))
 			return;
 
 		n->len = 128;
@@ -447,8 +376,7 @@ static void modify_neighbor(struct in6_addr *addr,
 	} else if (n->iface == iface) {
 		if (!n->iface)
 			time(&n->timeout);
-	} else if (iface && (!n->iface ||
-			(!iface->external && n->iface->external))) {
+	} else if (iface && (!n->iface || (!iface->external && n->iface->external))) {
 		setup_route(addr, n->iface, false);
 		n->iface = iface;
 		setup_route(addr, n->iface, add);
@@ -458,34 +386,22 @@ static void modify_neighbor(struct in6_addr *addr,
 	// on the old interface to confirm if the MACs match.
 }
 
-
 // Handler for neighbor cache entries from the kernel. This is our source
 // to learn and unlearn hosts on interfaces.
-static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
-		_unused struct relayd_interface *iface)
-{
-	for (struct nlmsghdr *nh = data; NLMSG_OK(nh, len);
-			nh = NLMSG_NEXT(nh, len)) {
+static void handle_rtnetlink(_unused void *addr, void *data, size_t len, _unused struct relayd_interface *iface) {
+	for (struct nlmsghdr *nh = data; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
 		struct rtmsg *rtm = NLMSG_DATA(nh);
-		if (config->enable_router_discovery_server &&
-				(nh->nlmsg_type == RTM_NEWROUTE ||
-				nh->nlmsg_type == RTM_DELROUTE) &&
-				rtm->rtm_dst_len == 0)
+		if (config->enable_router_discovery_server && (nh->nlmsg_type == RTM_NEWROUTE || nh->nlmsg_type == RTM_DELROUTE) && rtm->rtm_dst_len == 0)
 			raise(SIGUSR1); // Inform about a change in default route
 
 		struct ndmsg *ndm = NLMSG_DATA(nh);
 		struct ifaddrmsg *ifa = NLMSG_DATA(nh);
-		if (nh->nlmsg_type != RTM_NEWNEIGH
-				&& nh->nlmsg_type != RTM_DELNEIGH
-				&& nh->nlmsg_type != RTM_NEWADDR
-				&& nh->nlmsg_type != RTM_DELADDR)
+		if (nh->nlmsg_type != RTM_NEWNEIGH && nh->nlmsg_type != RTM_DELNEIGH && nh->nlmsg_type != RTM_NEWADDR && nh->nlmsg_type != RTM_DELADDR)
 			continue; // Unrelated message type
-		bool is_addr = (nh->nlmsg_type == RTM_NEWADDR
-				|| nh->nlmsg_type == RTM_DELADDR);
+		bool is_addr = (nh->nlmsg_type == RTM_NEWADDR || nh->nlmsg_type == RTM_DELADDR);
 
 		// Family and ifindex are on the same offset for NEIGH and ADDR
-		if (NLMSG_PAYLOAD(nh, 0) < sizeof(*ndm)
-				|| ndm->ndm_family != AF_INET6)
+		if (NLMSG_PAYLOAD(nh, 0) < sizeof(*ndm) || ndm->ndm_family != AF_INET6)
 			continue; //
 
 		// Lookup interface
@@ -499,15 +415,12 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 		ssize_t alen = NLMSG_PAYLOAD(nh, rta_offset);
 		struct in6_addr *addr = NULL;
 
-		for (struct rtattr *rta = (void*)(((uint8_t*)ndm) + rta_offset);
-				RTA_OK(rta, alen); rta = RTA_NEXT(rta, alen))
-			if (rta->rta_type == atype &&
-					RTA_PAYLOAD(rta) >= sizeof(*addr))
+		for (struct rtattr *rta = (void *)(((uint8_t *)ndm) + rta_offset); RTA_OK(rta, alen); rta = RTA_NEXT(rta, alen))
+			if (rta->rta_type == atype && RTA_PAYLOAD(rta) >= sizeof(*addr))
 				addr = RTA_DATA(rta);
 
 		// Address not specified or unrelated
-		if (!addr || IN6_IS_ADDR_LINKLOCAL(addr) ||
-				IN6_IS_ADDR_MULTICAST(addr))
+		if (!addr || IN6_IS_ADDR_LINKLOCAL(addr) || IN6_IS_ADDR_MULTICAST(addr))
 			continue;
 
 		// Check for states
@@ -515,9 +428,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 		if (is_addr)
 			add = (nh->nlmsg_type == RTM_NEWADDR);
 		else
-			add = (nh->nlmsg_type == RTM_NEWNEIGH && (ndm->ndm_state &
-				(NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE
-						| NUD_PERMANENT | NUD_NOARP)));
+			add = (nh->nlmsg_type == RTM_NEWNEIGH && (ndm->ndm_state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT | NUD_NOARP)));
 
 		if (config->enable_ndp_relay)
 			modify_neighbor(addr, iface, add);

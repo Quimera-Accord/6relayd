@@ -13,11 +13,17 @@
  */
 #pragma once
 
-#define ALL_DHCPV6_RELAYS {{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02}}}
+#define ALL_DHCPV6_RELAYS \
+	{ \
+		{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02}} \
+	}
 
-#define ALL_DHCPV6_SERVERS {{{0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03}}}
+#define ALL_DHCPV6_SERVERS \
+	{ \
+		{{0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03}} \
+	}
 
 #define DHCPV6_CLIENT_PORT 546
 #define DHCPV6_SERVER_PORT 547
@@ -62,9 +68,8 @@
 #define DHCPV6_STATUS_NOPREFIXAVAIL 6
 
 // I just remembered I have an old one lying around...
-#define DHCPV6_ENT_NO  30462
+#define DHCPV6_ENT_NO 30462
 #define DHCPV6_ENT_TYPE 1
-
 
 #define DHCPV6_HOP_COUNT_LIMIT 32
 
@@ -129,15 +134,10 @@ struct dhcpv6_ia_addr {
 	uint32_t valid;
 } _packed;
 
-
-
-
-#define dhcpv6_for_each_option(start, end, otype, olen, odata)\
-	for (uint8_t *_o = (uint8_t*)(start); _o + 4 <= (end) &&\
-		((otype) = _o[0] << 8 | _o[1]) && ((odata) = (void*)&_o[4]) &&\
-		((olen) = _o[2] << 8 | _o[3]) + (odata) <= (end); \
+#define dhcpv6_for_each_option(start, end, otype, olen, odata) \
+	for (uint8_t *_o = (uint8_t *)(start); \
+		_o + 4 <= (end) && ((otype) = _o[0] << 8 | _o[1]) && ((odata) = (void *)&_o[4]) && ((olen) = _o[2] << 8 | _o[3]) + (odata) <= (end); \
 		_o += 4 + (_o[2] << 8 | _o[3]))
 
 int dhcpv6_init_ia(const struct relayd_config *relayd_config, int socket);
-size_t dhcpv6_handle_ia(uint8_t *buf, size_t buflen, struct relayd_interface *iface,
-		const struct sockaddr_in6 *addr, const void *data, const uint8_t *end);
+size_t dhcpv6_handle_ia(uint8_t *buf, size_t buflen, struct relayd_interface *iface, const struct sockaddr_in6 *addr, const void *data, const uint8_t *end);
