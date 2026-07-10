@@ -253,7 +253,7 @@ static void handle_solicit(void *addr, void *data, size_t len,
 	time_t now = time(NULL);
 
 	struct ndp_neighbor *n = find_neighbor(&req->nd_ns_target, false);
-	if (n && (n->iface || abs(n->timeout - now) < 5)) {
+	if (n && (n->iface || llabs(n->timeout - now) < 5)) {
 		syslog(LOG_NOTICE, "%s is on %s", ipbuf,
 				(n->iface) ? n->iface->ifname : "<pending>");
 		if (!n->iface || n->iface == iface)
@@ -413,7 +413,7 @@ static struct ndp_neighbor* find_neighbor(struct in6_addr *addr, bool strict)
 				(n->len == 128 && IN6_ARE_ADDR_EQUAL(&n->addr, addr)))
 			return n;
 
-		if (!n->iface && abs(n->timeout - now) >= 5)
+		if (!n->iface && llabs(n->timeout - now) >= 5)
 			free_neighbor(n);
 	}
 	return NULL;

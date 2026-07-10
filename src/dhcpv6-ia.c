@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <stdio.h>
 
 
 struct assignment {
@@ -134,7 +135,7 @@ int dhcpv6_init_ia(const struct relayd_config *relayd_config, int dhcpv6_socket)
 static time_t monotonic_time(void)
 {
 	struct timespec ts;
-	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec;
 }
 
