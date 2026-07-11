@@ -68,7 +68,7 @@ int main(int argc, char *const argv[]) {
 	bool daemonize = false;
 	int verbosity = 0;
 	int c;
-	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvhw:")) != -1) {
+	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvhw:W")) != -1) {
 		switch (c) {
 		case 'A':
 			config.enable_router_discovery_relay = true;
@@ -162,13 +162,20 @@ int main(int argc, char *const argv[]) {
 			pidfile = optarg;
 			break;
 
-		// TODO(pd-lease-watcher): -w currently only takes a bare
-		// lease-file path and always targets the first slave
-		// interface (see wiring below, after slaves are opened).
-		// Extend to "-w <leasefile>:<slave-ifname>" once more than
-		// one watched slave is needed.
+			// TODO(pd-lease-watcher): -w currently only takes a bare
+			// lease-file path and always targets the first slave
+			// interface (see wiring below, after slaves are opened).
+			// Extend to "-w <leasefile>:<slave-ifname>" once more than
+			// one watched slave is needed.
 		case 'w':
 			pd_watcher_leasefile = optarg;
+			break;
+
+			// Disable pd-lease-watcher's automatic /64 on-link address
+			// (see pd_watcher_auto_address in pd-lease-watcher.h for why
+			// it exists / defaults to on). No-op unless -w is also given.
+		case 'W':
+			pd_watcher_auto_address = false;
 			break;
 
 		case 'd':
@@ -342,6 +349,10 @@ static int print_usage(const char *name) {
 		"			TODO: currently always targets the first slave\n"
 		"			given on the command line; does not yet accept\n"
 		"			a <leasefile>:<slave> pair.\n"
+		"	-W		DHCPv6-PD: with -w, don't auto-configure a /64\n"
+		"			on-link address on the watched slave for the\n"
+		"			delegated prefix (on by default -- needed so\n"
+		"			RAs advertise the prefix; see pd-lease-watcher.h)\n"
 		"\nInvocation options:\n"
 		"	-p <pidfile>	Set pidfile (/var/run/6relayd.pid)\n"
 		"	-d		Daemonize\n"
@@ -362,8 +373,9 @@ static void set_stop(_unused int signal) {
 
 // Create an interface context
 static int open_interface(struct relayd_interface *iface, const char *ifname, bool external) {
-	if (ifname[0] == '.' && iface == &config.master)
+	if (ifname[0] == '.' && iface == &config.master) {
 		return 0; // Skipped
+	}
 
 	int status = 0;
 
@@ -477,10 +489,11 @@ ssize_t relayd_forward_packet(int socket, struct sockaddr_in6 *dest, struct iove
 	inet_ntop(AF_INET6, &dest->sin6_addr, ipbuf, sizeof(ipbuf));
 
 	ssize_t sent = sendmsg(socket, &msg, MSG_DONTWAIT);
-	if (sent < 0)
+	if (sent < 0) {
 		syslog(LOG_WARNING, "Failed to relay to %s%%%s (%s)", ipbuf, iface->ifname, strerror(errno));
-	else
+	} else {
 		syslog(LOG_NOTICE, "Relayed %li bytes to %s%%%s", (long)sent, ipbuf, iface->ifname);
+	}
 	return sent;
 }
 
