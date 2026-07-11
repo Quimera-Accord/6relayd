@@ -37,13 +37,13 @@
 #define ALL_IPV6_NODES \
 	{ \
 		{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}} \
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}} \
 	}
 
 #define ALL_IPV6_ROUTERS \
 	{ \
 		{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}} \
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}} \
 	}
 
 struct relayd_interface;
@@ -74,6 +74,27 @@ struct relayd_interface {
 	struct relayd_ipaddr pd_addr[8];
 	size_t pd_addr_len;
 	bool pd_reconf;
+
+	// TODO(pd-lease-watcher): when pd_reconf is being (ab)used as the
+	// "PD source is the lease-file watcher" flag (see dhcpv6-ia.c
+	// update()), this records monotonic_time() at the moment the
+	// watcher last wrote pd_addr[], so update() can recover the
+	// original relative preferred/valid lifetimes instead of
+	// re-adding 'now' to already-absolute values on every 2s tick.
+	long pd_addr_applied_at;
+
+	// Persistent (never auto-cleared) counterpart to pd_reconf: true
+	// for the lifetime of the process once pd-lease-watcher.c has
+	// claimed this interface. pd_reconf itself is one-shot (cleared
+	// by reconf_timer() after a single tick, and also written by
+	// ndp.c for its own unrelated purpose), so it cannot safely gate
+	// update()'s watcher-vs-netlink choice on every call -- including
+	// the ones driven directly by incoming client packets, which
+	// happen far more often than the 2s timer. Without this, update()
+	// falls back to reading real kernel addresses off this interface
+	// on every DHCPv6 request once pd_reconf lapses, silently
+	// clobbering the watcher-fed delegation pool.
+	bool pd_watcher_managed;
 };
 
 #define RELAYD_MANAGED_MFLAG 1

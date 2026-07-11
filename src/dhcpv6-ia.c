@@ -361,15 +361,52 @@ static int prefixcmp(const void *va, const void *vb) {
 static void update(struct relayd_interface *iface) {
 	struct relayd_ipaddr addr[8];
 	memset(addr, 0, sizeof(addr));
-	int len = relayd_get_interface_addresses(iface->ifindex, addr, 8);
+	int len;
 
-	if (len < 0)
-		return;
+	// TODO(pd-lease-watcher): iface->pd_watcher_managed is the
+	// persistent counterpart of pd_reconf -- see the comment on it in
+	// 6relayd.h for why pd_reconf alone (one-shot, also written by
+	// ndp.c) can't gate this safely across every call site of
+	// update(), including the packet-driven one below.
+	bool from_watcher = iface->pd_watcher_managed && iface->pd_addr_len > 0;
+
+	if (from_watcher) {
+		// Prefix was already injected directly into iface->pd_addr by
+		// the watcher. Copy it into our local working array so the
+		// rest of this function (lifetime normalization, change
+		// detection, etc.) can treat it exactly like a netlink result.
+		len = (int)iface->pd_addr_len;
+		if (len > 8)
+			len = 8;
+		memcpy(addr, iface->pd_addr, len * sizeof(*addr));
+	} else {
+		len = relayd_get_interface_addresses(iface->ifindex, addr, 8);
+
+		if (len < 0)
+			return;
+	}
 
 	qsort(addr, len, sizeof(*addr), prefixcmp);
 
 	time_t now = monotonic_time();
 	int minprefix = -1;
+
+	if (from_watcher) {
+		// iface->pd_addr[] holds lifetimes already made absolute by a
+		// *previous* run of this same block (see below), stamped at
+		// iface->pd_addr_applied_at. Undo that here so the "+= now"
+		// pass a few lines down operates on relative durations again,
+		// exactly like a fresh netlink read would. Without this,
+		// preferred/valid would grow by ~`now` on every 2s timer tick.
+		long elapsed = now - iface->pd_addr_applied_at;
+		if (elapsed < 0)
+			elapsed = 0;
+
+		for (int i = 0; i < len; ++i) {
+			addr[i].preferred = (addr[i].preferred > (uint32_t)elapsed) ? addr[i].preferred - (uint32_t)elapsed : 0;
+			addr[i].valid = (addr[i].valid > (uint32_t)elapsed) ? addr[i].valid - (uint32_t)elapsed : 0;
+		}
+	}
 
 	for (int i = 0; i < len; ++i) {
 		if (addr[i].prefix > minprefix)
@@ -385,15 +422,19 @@ static void update(struct relayd_interface *iface) {
 			addr[i].valid += now;
 	}
 
+	if (from_watcher)
+		iface->pd_addr_applied_at = now;
+
 	struct assignment *border = list_last_entry(&iface->pd_assignments, struct assignment, head);
 	border->assigned = 1 << (64 - minprefix);
 
 	bool change = len != (int)iface->pd_addr_len;
-	for (int i = 0; !change && i < len; ++i)
+	for (int i = 0; !change && i < len; ++i) {
 		if (addr[i].addr.s6_addr32[0] != iface->pd_addr[i].addr.s6_addr32[0] || addr[i].addr.s6_addr32[1] != iface->pd_addr[i].addr.s6_addr32[1] ||
 			(addr[i].preferred > 0) != (iface->pd_addr[i].preferred > 0) ||
 			(addr[i].valid > (uint32_t)now + 7200) != (iface->pd_addr[i].valid > (uint32_t)now + 7200))
 			change = true;
+	}
 
 	if (change) {
 		struct assignment *c;

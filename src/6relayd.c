@@ -38,8 +38,14 @@
 #include <fcntl.h>
 
 #include "6relayd.h"
+#include "pd-lease-watcher.h"
 
 static struct relayd_config config;
+
+// TODO(pd-lease-watcher): hardcoded to a single lease-file path here.
+// Generalize to <leasefile>:<slave-ifname> pairs (parsed like -t's
+// <p>/<l>:<if> syntax) if we ever need to watch more than one PD source.
+static const char *pd_watcher_leasefile = NULL;
 
 static int epoll, ioctl_sock;
 static size_t epoll_registered = 0;
@@ -62,7 +68,7 @@ int main(int argc, char *const argv[]) {
 	bool daemonize = false;
 	int verbosity = 0;
 	int c;
-	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvh")) != -1) {
+	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvhw:")) != -1) {
 		switch (c) {
 		case 'A':
 			config.enable_router_discovery_relay = true;
@@ -156,6 +162,15 @@ int main(int argc, char *const argv[]) {
 			pidfile = optarg;
 			break;
 
+		// TODO(pd-lease-watcher): -w currently only takes a bare
+		// lease-file path and always targets the first slave
+		// interface (see wiring below, after slaves are opened).
+		// Extend to "-w <leasefile>:<slave-ifname>" once more than
+		// one watched slave is needed.
+		case 'w':
+			pd_watcher_leasefile = optarg;
+			break;
+
 		case 'd':
 			daemonize = true;
 			break;
@@ -216,6 +231,20 @@ int main(int argc, char *const argv[]) {
 
 	struct sigaction sa = {.sa_handler = SIG_IGN};
 	sigaction(SIGUSR1, &sa, NULL);
+
+	// TODO(pd-lease-watcher): hardcoded to config.slaves[0] (intended
+	// to be br0 in the current single-slave deployment). Must be
+	// generalized (see -w parsing above) before this is used with more
+	// than one slave interface, or the wrong interface may get fed the
+	// watched prefix.
+	if (pd_watcher_leasefile) {
+		if (config.slavecount < 1) {
+			syslog(LOG_ERR, "-w given but no slave interfaces configured");
+			return 4;
+		}
+		if (init_pd_lease_watcher(pd_watcher_leasefile, &config.slaves[0]))
+			return 4;
+	}
 
 	if (init_router_discovery_relay(&config))
 		return 4;
@@ -306,6 +335,13 @@ static int print_usage(const char *name) {
 		"	-t <p>/<l>:<if>	NDP: define a static NDP-prefix on <if>\n"
 		"	slave prefix ~	NDP: don't proxy NDP for hosts and only\n"
 		"			serve NDP for DAD and traffic to router\n"
+		"	-w <leasefile>	DHCPv6-PD: watch an ISC dhclient IPv6 lease\n"
+		"			file for iaprefix changes and feed the result\n"
+		"			directly to the first slave interface, instead\n"
+		"			of reading netlink addresses off that slave.\n"
+		"			TODO: currently always targets the first slave\n"
+		"			given on the command line; does not yet accept\n"
+		"			a <leasefile>:<slave> pair.\n"
 		"\nInvocation options:\n"
 		"	-p <pidfile>	Set pidfile (/var/run/6relayd.pid)\n"
 		"	-d		Daemonize\n"
