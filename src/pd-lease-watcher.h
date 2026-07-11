@@ -22,3 +22,13 @@ struct relayd_interface;
 extern bool pd_watcher_auto_address;
 
 int init_pd_lease_watcher(const char *leasefile, struct relayd_interface *target_slave);
+
+// Called once on clean shutdown (SIGTERM/SIGHUP/SIGINT), *before* the
+// process actually exits. No-op if init_pd_lease_watcher() was never
+// called (-w not given). Mirrors what pd_watcher_parse_and_apply() does
+// when it sees the delegated prefix change to a *different* one: send an
+// explicit RA invalidation (valid=0 preferred=0) for the currently-applied
+// prefix and remove the on-link kernel address we configured for it, so
+// the old delegation doesn't linger on the LAN or on target_slave just
+// because we stopped watching it.
+void deinit_pd_lease_watcher(void);

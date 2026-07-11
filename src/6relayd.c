@@ -301,6 +301,7 @@ int main(int argc, char *const argv[]) {
 
 	syslog(LOG_WARNING, "Termination requested by signal.");
 
+	deinit_pd_lease_watcher();
 	deinit_ndp_proxy();
 	deinit_router_discovery_relay();
 	free(config.slaves);

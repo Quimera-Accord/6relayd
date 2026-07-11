@@ -17,6 +17,20 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+struct relayd_interface;
+
+// Immediately send a one-off RA to `iface` containing a single Prefix
+// Information Option for `addr`/`prefixlen` with valid/preferred lifetimes
+// forced to 0. Used when a delegated prefix changes out from under a
+// running relay (e.g. pd-lease-watcher.c noticing the ISP handed out a new
+// /56 after a ppp0 reconnect): removing the stale on-link kernel address
+// only keeps it out of the *next* periodic RA, it does not retroactively
+// tell hosts that already cached the old prefix (with its original,
+// possibly multi-day lifetime) to drop it now. This is the "prefix changed
+// while running" counterpart to deinit_router_discovery_relay()'s final
+// RA on shutdown.
+void router_invalidate_prefix(struct relayd_interface *iface, const struct in6_addr *addr, uint8_t prefixlen);
+
 struct icmpv6_opt {
 	uint8_t type;
 	uint8_t len;

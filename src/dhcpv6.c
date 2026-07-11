@@ -244,7 +244,14 @@ static void handle_client_request(void *addr, void *data, size_t len, struct rel
 
 	if (opts[-4] != DHCPV6_MSG_INFORMATION_REQUEST) {
 		iov[4].iov_len = dhcpv6_handle_ia(pdbuf, sizeof(pdbuf), iface, addr, &opts[-4], opts_end);
-		if (iov[4].iov_len == 0 && opts[-4] == DHCPV6_MSG_REBIND)
+		// REBIND: silence-on-nothing-usable was already the rule here.
+		// RENEW: extended to match -- dhcpv6_handle_ia() now stays
+		// silent per-IA when nothing usable is available (e.g. right
+		// after a delegated-prefix change, before the new one lands),
+		// specifically so the client sees an unanswered Renew rather
+		// than a "successful" Reply with a status code, since that's
+		// what actually makes it drop the stale routes promptly.
+		if (iov[4].iov_len == 0 && (opts[-4] == DHCPV6_MSG_REBIND || opts[-4] == DHCPV6_MSG_RENEW))
 			return;
 	}
 
