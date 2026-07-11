@@ -634,5 +634,31 @@ static void relayd_receive_packets(struct relayd_event *event) {
 }
 
 void relayd_urandom(void *data, size_t len) {
-	read(urandom_fd, data, len);
+	uint8_t *p = data;
+	while (len > 0) {
+		ssize_t n = read(urandom_fd, p, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			syslog(LOG_ERR,
+				"relayd_urandom: read from /dev/urandom "
+				"failed: %s",
+				strerror(errno));
+			break;
+		}
+		if (n == 0)
+			break; // shouldn't happen for /dev/urandom, but don't spin
+		p += n;
+		len -= (size_t)n;
+	}
+
+	if (len > 0) {
+		// Better than leaving key material as uninitialized stack/heap
+		// garbage, and loud enough that it won't go unnoticed.
+		syslog(LOG_ERR,
+			"relayd_urandom: only got partial random data, "
+			"zeroing remaining %zu byte(s)",
+			len);
+		memset(p, 0, len);
+	}
 }

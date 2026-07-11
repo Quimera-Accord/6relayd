@@ -198,7 +198,12 @@ static void write_statefile(void) {
 			return;
 		}
 		lockf(fd, F_LOCK, 0);
-		ftruncate(fd, 0);
+		if (ftruncate(fd, 0) < 0) {
+			// Non-fatal: we still (re)write the file below, but if this
+			// failed and the new content ends up shorter than whatever
+			// was there before, stale trailing bytes would linger.
+			syslog(LOG_WARNING, "write_statefile: ftruncate(%s) failed: %s", config->dhcpv6_statefile, strerror(errno));
+		}
 
 		FILE *fp = fdopen(fd, "w");
 		if (!fp) {
