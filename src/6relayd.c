@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -38,14 +39,15 @@
 #include <fcntl.h>
 
 #include "6relayd.h"
-#include "pd-lease-watcher.h"
+#include "pd-sniffer.h"
 
 static struct relayd_config config;
 
-// TODO(pd-lease-watcher): hardcoded to a single lease-file path here.
-// Generalize to <leasefile>:<slave-ifname> pairs (parsed like -t's
-// <p>/<l>:<if> syntax) if we ever need to watch more than one PD source.
-static const char *pd_watcher_leasefile = NULL;
+// See -W in the getopt switch below.
+static bool pd_sniffer_enable = false;
+
+// See -F in the getopt switch below. NULL (default) disables the fallback.
+static const char *pd_sniffer_fallback_leasefile = NULL;
 
 static int epoll, ioctl_sock;
 static size_t epoll_registered = 0;
@@ -54,6 +56,30 @@ static volatile bool do_stop = false;
 static int rtnl_socket = -1;
 static int rtnl_seq = 0;
 static int urandom_fd = -1;
+
+// See the #define in 6relayd.h: every syslog(...) call site in the
+// project ends up here. openlog() has no timestamp option of its own, so
+// this just stamps "YYYY-MM-DD HH:MM:SS" onto the front of the message
+// and hands it to the real syslog(3). The #undef/#define pair around the
+// call is needed because 6relayd.h's #define syslog relayd_log would
+// otherwise turn the call below into infinite recursion.
+#undef syslog
+void relayd_log(int priority, const char *format, ...) {
+	char msgbuf[512];
+	va_list ap;
+	va_start(ap, format);
+	vsnprintf(msgbuf, sizeof(msgbuf), format, ap);
+	va_end(ap);
+
+	time_t now = time(NULL);
+	struct tm tm_now;
+	localtime_r(&now, &tm_now);
+	char timebuf[32];
+	strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tm_now);
+
+	syslog(priority, "%s %s", timebuf, msgbuf);
+}
+#define syslog relayd_log
 
 static int print_usage(const char *name);
 static void set_stop(_unused int signal);
@@ -68,7 +94,7 @@ int main(int argc, char *const argv[]) {
 	bool daemonize = false;
 	int verbosity = 0;
 	int c;
-	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvhw:W")) != -1) {
+	while ((c = getopt(argc, argv, "ASR:D:Nsucn::l:a:rt:m:oi:p:dvhWwF:")) != -1) {
 		switch (c) {
 		case 'A':
 			config.enable_router_discovery_relay = true;
@@ -162,20 +188,37 @@ int main(int argc, char *const argv[]) {
 			pidfile = optarg;
 			break;
 
-			// TODO(pd-lease-watcher): -w currently only takes a bare
-			// lease-file path and always targets the first slave
-			// interface (see wiring below, after slaves are opened).
-			// Extend to "-w <leasefile>:<slave-ifname>" once more than
-			// one watched slave is needed.
-		case 'w':
-			pd_watcher_leasefile = optarg;
+			// Sniff DHCPv6 REPLY packets directly off the WAN (master)
+			// interface for IA_PD prefixes, instead of watching a
+			// dhclient lease file (see pd-sniffer.c). Always targets
+			// config.master as the sniffed interface and
+			// config.slaves[0] as the interface the prefix gets
+			// applied to (see wiring below, after both are opened).
+			//
+			// TODO(pd-sniffer): hardcoded to (master, slaves[0]).
+			// Generalize if more than one WAN uplink / target slave is
+			// ever needed.
+		case 'W':
+			pd_sniffer_enable = true;
 			break;
 
-			// Disable pd-lease-watcher's automatic /64 on-link address
-			// (see pd_watcher_auto_address in pd-lease-watcher.h for why
-			// it exists / defaults to on). No-op unless -w is also given.
-		case 'W':
-			pd_watcher_auto_address = false;
+			// Dry run: pd-sniffer parses and logs everything it sees but
+			// applies nothing (no netlink address changes, no
+			// pd_addr_pending updates -- see pd_sniffer_dry_run in
+			// pd-sniffer.h). No-op unless -W is also given. Meant for
+			// verifying it's actually seeing/parsing the ISP's REPLYs
+			// correctly via -v before trusting it to apply anything.
+		case 'w':
+			pd_sniffer_dry_run = true;
+			break;
+
+			// Startup-only fallback: if pd-sniffer hasn't captured any
+			// REPLY within PD_SNIFFER_FALLBACK_SECS of starting, read
+			// this ISC dhclient lease file once and apply its most
+			// recent iaprefix instead (see init_pd_sniffer()'s doc
+			// comment in pd-sniffer.h). No-op unless -W is also given.
+		case 'F':
+			pd_sniffer_fallback_leasefile = optarg;
 			break;
 
 		case 'd':
@@ -191,11 +234,14 @@ int main(int argc, char *const argv[]) {
 		}
 	}
 
-	openlog("6relayd", LOG_PERROR | LOG_PID, LOG_DAEMON);
+	openlog("6relayd", LOG_PID | (daemonize ? 0 : LOG_PERROR), LOG_DAEMON);
+
 	if (verbosity == 0)
 		setlogmask(LOG_UPTO(LOG_WARNING));
 	else if (verbosity == 1)
 		setlogmask(LOG_UPTO(LOG_INFO));
+	else
+		setlogmask(LOG_UPTO(LOG_DEBUG));
 
 	if (argc - optind < 1)
 		return print_usage(argv[0]);
@@ -239,17 +285,21 @@ int main(int argc, char *const argv[]) {
 	struct sigaction sa = {.sa_handler = SIG_IGN};
 	sigaction(SIGUSR1, &sa, NULL);
 
-	// TODO(pd-lease-watcher): hardcoded to config.slaves[0] (intended
-	// to be br0 in the current single-slave deployment). Must be
-	// generalized (see -w parsing above) before this is used with more
-	// than one slave interface, or the wrong interface may get fed the
-	// watched prefix.
-	if (pd_watcher_leasefile) {
+	// TODO(pd-sniffer): hardcoded to config.master (intended to be ppp0)
+	// and config.slaves[0] (intended to be br0) in the current
+	// single-WAN/single-slave deployment. Must be generalized (see -W
+	// parsing above) before this is used with more than one WAN uplink,
+	// or the wrong interface pair may get wired together.
+	if (pd_sniffer_fallback_leasefile && !pd_sniffer_enable) {
+		syslog(LOG_ERR, "-F given without -W: fallback has nothing to fall back for");
+		return 4;
+	}
+	if (pd_sniffer_enable) {
 		if (config.slavecount < 1) {
-			syslog(LOG_ERR, "-w given but no slave interfaces configured");
+			syslog(LOG_ERR, "-W given but no slave interfaces configured");
 			return 4;
 		}
-		if (init_pd_lease_watcher(pd_watcher_leasefile, &config.slaves[0]))
+		if (init_pd_sniffer(&config.master, &config.slaves[0], pd_sniffer_fallback_leasefile))
 			return 4;
 	}
 
@@ -269,7 +319,6 @@ int main(int argc, char *const argv[]) {
 	}
 
 	if (daemonize) {
-		openlog("6relayd", LOG_PID, LOG_DAEMON); // Disable LOG_PERROR
 		if (daemon(0, 0)) {
 			syslog(LOG_ERR, "Failed to daemonize: %s", strerror(errno));
 			return 6;
@@ -301,6 +350,7 @@ int main(int argc, char *const argv[]) {
 
 	syslog(LOG_WARNING, "Termination requested by signal.");
 
+	deinit_pd_sniffer();
 	deinit_ndp_proxy();
 	deinit_router_discovery_relay();
 	free(config.slaves);
@@ -342,21 +392,33 @@ static int print_usage(const char *name) {
 		"	-t <p>/<l>:<if>	NDP: define a static NDP-prefix on <if>\n"
 		"	slave prefix ~	NDP: don't proxy NDP for hosts and only\n"
 		"			serve NDP for DAD and traffic to router\n"
-		"	-w <leasefile>	DHCPv6-PD: watch an ISC dhclient IPv6 lease\n"
-		"			file for iaprefix changes and feed the result\n"
+		"	-W		DHCPv6-PD: sniff DHCPv6 REPLY packets directly off\n"
+		"			<master> for IA_PD prefixes and feed the result\n"
 		"			directly to the first slave interface, instead\n"
-		"			of reading netlink addresses off that slave.\n"
-		"			TODO: currently always targets the first slave\n"
-		"			given on the command line; does not yet accept\n"
-		"			a <leasefile>:<slave> pair.\n"
-		"	-W		DHCPv6-PD: with -w, don't auto-configure a /64\n"
-		"			on-link address on the watched slave for the\n"
-		"			delegated prefix (on by default -- needed so\n"
-		"			RAs advertise the prefix; see pd-lease-watcher.h)\n"
+		"			of watching a dhclient lease file or reading\n"
+		"			netlink addresses off that slave. Also\n"
+		"			auto-configures a /64 on-link address on the\n"
+		"			target slave for the delegated prefix (needed\n"
+		"			so RAs actually advertise it).\n"
+		"			TODO: currently always sniffs <master> and\n"
+		"			targets the first slave given on the command\n"
+		"			line; does not yet accept other pairings.\n"
+		"	-w		DHCPv6-PD: with -W, dry run -- parse and log\n"
+		"			everything pd-sniffer sees, but don't apply\n"
+		"			any of it (no addresses set/removed, nothing\n"
+		"			handed to DHCPv6-PD/NA clients or RAs). Use to\n"
+		"			verify it's parsing the ISP's REPLYs correctly\n"
+		"			via syslog before trusting -W on its own.\n"
+		"	-F <leasefile>	DHCPv6-PD: with -W, startup-only fallback --\n"
+		"			read this ISC dhclient lease file immediately at\n"
+		"			startup and apply its most recent iaprefix (no\n"
+		"			delay). Not a continuous watch: once past startup,\n"
+		"			pd-sniffer is the only source from then on. A live\n"
+		"			DHCPv6 REPLY captured afterward always overrides it.\n"
 		"\nInvocation options:\n"
 		"	-p <pidfile>	Set pidfile (/var/run/6relayd.pid)\n"
 		"	-d		Daemonize\n"
-		"	-v		Increase logging verbosity\n"
+		"	-v		Increase logging verbosity (repeatable: -v info, -vv debug)\n"
 		"	-h		Show this help\n\n",
 		name);
 	return 1;
@@ -443,7 +505,8 @@ int relayd_get_interface_mtu(const char *ifname) {
 // Read IPv6 MAC for interface
 int relayd_get_interface_mac(const char *ifname, uint8_t mac[6]) {
 	struct ifreq ifr;
-	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ifr.ifr_name[sizeof(ifr.ifr_name) - 1] = 0;
 	if (ioctl(ioctl_sock, SIOCGIFHWADDR, &ifr) < 0)
 		return -1;
 	memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
@@ -597,8 +660,21 @@ static void relayd_receive_packets(struct relayd_event *event) {
 		if (len < 0) {
 			if (errno == EAGAIN)
 				break;
-			else
+			else if (errno == EINTR)
 				continue;
+			else {
+				// Any other errno (ENOBUFS, ECONNREFUSED,
+				// ENETUNREACH, ...) is a real, typically
+				// persistent condition. Retrying it in a
+				// MSG_DONTWAIT loop never blocks and never
+				// yields EAGAIN again, so looping here spun
+				// the CPU forever with zero log output (the
+				// syslog() calls below are only reached on
+				// the success path). Log it once and give
+				// the socket back to epoll instead.
+				syslog(LOG_ERR, "recvmsg on fd %d failed: %s", event->socket, strerror(errno));
+				break;
+			}
 		}
 
 		// Extract destination interface
@@ -638,16 +714,18 @@ void relayd_urandom(void *data, size_t len) {
 	while (len > 0) {
 		ssize_t n = read(urandom_fd, p, len);
 		if (n < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR) {
 				continue;
+			}
 			syslog(LOG_ERR,
 				"relayd_urandom: read from /dev/urandom "
 				"failed: %s",
 				strerror(errno));
 			break;
 		}
-		if (n == 0)
+		if (n == 0) {
 			break; // shouldn't happen for /dev/urandom, but don't spin
+		}
 		p += n;
 		len -= (size_t)n;
 	}

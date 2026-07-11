@@ -4,7 +4,7 @@ project(6relayd C)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 add_executable(6relayd
 	src/6relayd.c
@@ -13,7 +13,7 @@ add_executable(6relayd
 	src/ndp.c
 	src/md5.c
 	src/dhcpv6-ia.c
-	src/pd-lease-watcher.c
+	src/pd-sniffer.c
 )
 
 target_compile_definitions(6relayd PRIVATE
@@ -21,14 +21,29 @@ target_compile_definitions(6relayd PRIVATE
 	_FORTIFY_SOURCE=2
 )
 
+# -O2 rather than -O3: this is a small, syscall/IO-bound network daemon,
+# not a numeric hot loop -- -O3's extra inlining/vectorization tends to
+# just grow code size (and instruction-cache pressure) on a small-cache
+# embedded MIPS target without a measurable runtime win here. No -g:
+# release build, size/speed only, no debug symbols. Kept
+# -fstack-protector-strong per explicit request (cheap insurance, not
+# worth trading away for this).
 target_compile_options(6relayd PRIVATE
-	-g -Wall -Wextra -Werror -pedantic
+	-O2
+	-Wall -Wextra -Werror -pedantic
 	-Wformat -Wformat-security
 	-fstack-protector-strong
 	-ffunction-sections -fdata-sections
 )
 
-target_link_options(6relayd PRIVATE -Wl,--gc-sections)
+# Cross toolchain target: mips32r2 (per project SoC). Only applied when
+# actually cross-compiling for MIPS -- harmless/skipped on a native x86_64
+# dev/test build, so this doesn't break `cmake .` on a regular machine.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "mips")
+	target_compile_options(6relayd PRIVATE -march=mips32r2)
+endif()
+
+target_link_options(6relayd PRIVATE -Wl,--gc-sections -s -static)
 
 target_link_libraries(6relayd resolv)
 

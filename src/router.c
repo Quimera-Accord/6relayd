@@ -12,10 +12,10 @@
  *
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/route.h>
-#include <resolv.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -108,6 +108,45 @@ void deinit_router_discovery_relay(void) {
 		for (size_t i = 0; i < config->slavecount; ++i)
 			send_router_advert(&config->slaves[i].timer_rs);
 	}
+}
+
+void router_invalidate_prefix(struct relayd_interface *iface, const struct in6_addr *addr, uint8_t prefixlen) {
+	if (!config || !config->enable_router_discovery_server)
+		return;
+
+	// PIOs are always emitted as /64s elsewhere in this file (see
+	// send_router_advert()); mirror that here rather than trying to
+	// support arbitrary lengths in a one-off invalidation packet.
+	if (prefixlen == 0 || prefixlen > 64)
+		return;
+
+	struct {
+		struct nd_router_advert h;
+		struct nd_opt_prefix_info prefix;
+	} adv = {
+		.h = {{.icmp6_type = ND_ROUTER_ADVERT, .icmp6_code = 0}, 0, 0},
+	};
+
+	struct nd_opt_prefix_info *p = &adv.prefix;
+	memcpy(&p->nd_opt_pi_prefix, addr, 8);
+	p->nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
+	p->nd_opt_pi_len = 4;
+	p->nd_opt_pi_prefix_len = 64;
+	p->nd_opt_pi_flags_reserved = 0;
+	if (!config->ra_not_onlink)
+		p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_ONLINK;
+	if (config->ra_managed_mode < RELAYD_MANAGED_NO_AFLAG)
+		p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_AUTO;
+	p->nd_opt_pi_valid_time = 0;
+	p->nd_opt_pi_preferred_time = 0;
+
+	struct iovec iov = {&adv, sizeof(adv)};
+	struct sockaddr_in6 all_nodes = {AF_INET6, 0, 0, ALL_IPV6_NODES, 0};
+	relayd_forward_packet(router_discovery_event.socket, &all_nodes, &iov, 1, iface);
+
+	char addrbuf[INET6_ADDRSTRLEN];
+	inet_ntop(AF_INET6, addr, addrbuf, sizeof(addrbuf));
+	syslog(LOG_NOTICE, "Sent immediate RA invalidation (valid=0 preferred=0) for stale prefix %s/64 on %s", addrbuf, iface->ifname);
 }
 
 // Signal handler to resend all RDs
@@ -247,7 +286,6 @@ static void send_router_advert(struct relayd_event *event) {
 		adv.h.nd_ra_flags_reserved |= ND_RA_PREF_HIGH;
 	relayd_get_interface_mac(iface->ifname, adv.lladdr.data);
 
-	// If not currently shutting down
 	struct relayd_ipaddr addrs[RELAYD_MAX_PREFIXES];
 	ssize_t ipcnt = 0;
 
@@ -256,14 +294,25 @@ static void send_router_advert(struct relayd_event *event) {
 
 		if (parse_routes(addrs, ipcnt)) // Have default route
 			adv.h.nd_ra_router_lifetime = htons(3 * MaxRtrAdvInterval);
+	} else {
+		// Final RA on shutdown: still fetch the prefixes/addresses we were
+		// announcing, but force their valid/preferred lifetimes to 0 so we
+		// emit explicit Prefix Information / Route Information Options
+		// telling hosts and downstream routers to invalidate them right
+		// away, instead of silently omitting the options and leaving
+		// everyone to wait out the previous (up to 259200s) lifetime.
+		// Router lifetime is intentionally left at 0 (its default here)
+		// so we also immediately stop being treated as a default router.
+		ipcnt = relayd_get_interface_addresses(iface->ifindex, addrs, ARRAY_SIZE(addrs));
+		for (ssize_t i = 0; i < ipcnt; ++i) {
+			addrs[i].preferred = 0;
+			addrs[i].valid = 0;
+		}
 	}
 
 	// Construct Prefix Information options
 	bool have_public = false;
 	size_t cnt = 0;
-
-	const struct in6_addr *pref_addr = NULL;
-	uint32_t pref_time = 0;
 
 	for (ssize_t i = 0; i < ipcnt; ++i) {
 		struct relayd_ipaddr *addr = &addrs[i];
@@ -303,11 +352,6 @@ static void send_router_advert(struct relayd_event *event) {
 			p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_AUTO;
 		p->nd_opt_pi_valid_time = htonl(addr->valid);
 		p->nd_opt_pi_preferred_time = htonl(addr->preferred);
-
-		if (addr->preferred > pref_time) {
-			pref_time = addr->preferred;
-			pref_addr = &addr->addr;
-		}
 	}
 
 	if (!have_public && !config->always_announce_default_router && adv.h.nd_ra_router_lifetime) {
@@ -322,44 +366,6 @@ static void send_router_advert(struct relayd_event *event) {
 		for (size_t i = 0; i < cnt; ++i)
 			if ((adv.prefix[i].nd_opt_pi_prefix.s6_addr[0] & 0xfe) == 0xfc)
 				adv.prefix[i].nd_opt_pi_preferred_time = 0;
-
-	struct {
-		uint8_t type;
-		uint8_t len;
-		uint8_t pad;
-		uint8_t pad2;
-		uint32_t lifetime;
-		struct in6_addr addr;
-	} dns = {ND_OPT_RECURSIVE_DNS, 3, 0, 0, htonl(pref_time), IN6ADDR_ANY_INIT};
-	size_t dnslen = 0;
-
-	if (config->always_rewrite_dns && !IN6_IS_ADDR_UNSPECIFIED(&config->dnsaddr))
-		pref_addr = &config->dnsaddr;
-
-	if (pref_addr) {
-		dns.addr = *pref_addr;
-		dnslen = sizeof(dns);
-	}
-
-	struct {
-		uint8_t type;
-		uint8_t len;
-		uint8_t pad;
-		uint8_t pad2;
-		uint32_t lifetime;
-		uint8_t name[256];
-	} domain = {ND_OPT_DNS_SEARCH, 3, 0, 0, htonl(3 * MaxRtrAdvInterval), {0}};
-	size_t domain_len = 0;
-
-	res_init();
-	const char *search = _res.dnsrch[0];
-	if (search && search[0]) {
-		int len = dn_comp(search, domain.name, sizeof(domain.name), NULL, NULL);
-		if (len > 0) {
-			domain_len = ((len + 7) & (~7)) + 8;
-			domain.len = domain_len / 8;
-		}
-	}
 
 	size_t routes_cnt = 0;
 	struct {
@@ -397,10 +403,12 @@ static void send_router_advert(struct relayd_event *event) {
 		++routes_cnt;
 	}
 
-	struct iovec iov[] = {
-		{&adv, (uint8_t *)&adv.prefix[cnt] - (uint8_t *)&adv}, {&routes, routes_cnt * sizeof(*routes)}, {&dns, dnslen}, {&domain, domain_len}};
+	// No DNS server is run on this box, so the RA carries only Prefix
+	// Information (IA_PD-derived prefixes) and Route Information -- no
+	// RDNSS/DNS Search List option is constructed or sent at all.
+	struct iovec iov[] = {{&adv, (uint8_t *)&adv.prefix[cnt] - (uint8_t *)&adv}, {&routes, routes_cnt * sizeof(*routes)}};
 	struct sockaddr_in6 all_nodes = {AF_INET6, 0, 0, ALL_IPV6_NODES, 0};
-	relayd_forward_packet(router_discovery_event.socket, &all_nodes, iov, 4, iface);
+	relayd_forward_packet(router_discovery_event.socket, &all_nodes, iov, 2, iface);
 
 	// Rearm timer
 	struct itimerspec val = {{0, 0}, {0, 0}};

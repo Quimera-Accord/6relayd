@@ -21,6 +21,14 @@
 
 #include "list.h"
 
+// Every syslog(...) call site in the project gets redirected to
+// relayd_log() below, which just prefixes a timestamp onto the message
+// and hands it straight to the real vsyslog(3) -- openlog() itself has
+// no timestamp option, so this is the only way to get one into
+// LOG_PERROR's stderr copy too. See 6relayd.c for the implementation.
+void relayd_log(int priority, const char *format, ...) __attribute__((format(printf, 2, 3)));
+#define syslog relayd_log
+
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 // RFC 6106 defines this router advertisement option
@@ -37,13 +45,13 @@
 #define ALL_IPV6_NODES \
 	{ \
 		{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}} \
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}} \
 	}
 
 #define ALL_IPV6_ROUTERS \
 	{ \
 		{{0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}} \
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}} \
 	}
 
 struct relayd_interface;
@@ -95,6 +103,40 @@ struct relayd_interface {
 	// on every DHCPv6 request once pd_reconf lapses, silently
 	// clobbering the watcher-fed delegation pool.
 	bool pd_watcher_managed;
+
+	// Staging area pd-lease-watcher.c writes a newly-parsed prefix into,
+	// instead of pd_addr[] directly. update() (dhcpv6-ia.c) detects a
+	// delegated-prefix change (and reconfigures downstream DHCPv6-PD/NA
+	// clients accordingly) by comparing a freshly-read prefix against the
+	// previously-committed pd_addr[]. For a netlink-backed interface that
+	// works because the "fresh read" (relayd_get_interface_addresses())
+	// and pd_addr[] (last commit) are two genuinely different arrays. But
+	// if the watcher wrote straight into pd_addr[] as before, update()
+	// would end up comparing pd_addr[] against itself -- always "no
+	// change", so reconfigure never fired. Routing new watcher data
+	// through this staging area instead keeps pd_addr[] holding the
+	// last-committed value until update() itself diffs and copies the
+	// pending data over, exactly mirroring the netlink path.
+	struct relayd_ipaddr pd_addr_pending[8];
+	size_t pd_addr_pending_len;
+	bool pd_addr_pending_valid; // one-shot: set by the watcher, cleared by update() once consumed
+
+	// Snapshot of pd_addr[0] taken by update() (dhcpv6-ia.c) right
+	// before it overwrites pd_addr[] with a freshly-changed delegation
+	// (including the case where the new delegation is empty, e.g. the
+	// upstream link just bounced). Kept around specifically so a
+	// Renew/Rebind that arrives for an already-bound client during that
+	// gap can still be answered with an explicit valid=0/preferred=0
+	// IA_PD-prefix/IA_NA-address option -- i.e. a real RFC 3315/3633
+	// invalidation of *exactly* what that client was told it had --
+	// instead of either silently dropping the packet (which a real
+	// client just interprets as packet loss and keeps using the old
+	// binding until it naturally expires) or returning a bare status
+	// code with no address/prefix option at all (observed with
+	// MikroTik's dhcpv6-client to NOT cause the old routes to be
+	// dropped either).
+	struct relayd_ipaddr last_pd_addr;
+	bool last_pd_addr_valid;
 };
 
 #define RELAYD_MANAGED_MFLAG 1

@@ -186,6 +186,15 @@ static void handle_client_request(void *addr, void *data, size_t len, struct rel
 		uint32_t value;
 	} refresh = {htons(DHCPV6_OPT_INFO_REFRESH), htons(sizeof(uint32_t)), htonl(600)};
 
+	// res_init() re-reads and re-parses /etc/resolv.conf from disk every
+	// time it's called -- expensive to do on every single DHCPv6 packet
+	// (this function runs once per Solicit/Request/Renew/Rebind/etc).
+	// resolv.conf essentially never changes at runtime, so build the
+	// domain-search option once on the first call and reuse it after.
+	static bool domain_built = false;
+	static uint8_t domain_name_cache[255];
+	static size_t domain_len_cache = 0;
+
 	struct __attribute__((packed)) {
 		uint16_t type;
 		uint16_t len;
@@ -199,14 +208,21 @@ static void handle_client_request(void *addr, void *data, size_t len, struct rel
 		struct in6_addr addr;
 	} dnsaddr = {htons(DHCPV6_OPT_DNS_SERVERS), htons(sizeof(struct in6_addr)), IN6ADDR_ANY_INIT};
 
-	res_init();
-	const char *search = _res.dnsrch[0];
-	if (search && search[0]) {
-		int len = dn_comp(search, domain.name, sizeof(domain.name), NULL, NULL);
-		if (len > 0) {
-			domain.len = htons(len);
-			domain_len = len + 4;
+	if (!domain_built) {
+		res_init();
+		const char *search = _res.dnsrch[0];
+		if (search && search[0]) {
+			int len = dn_comp(search, domain_name_cache, sizeof(domain_name_cache), NULL, NULL);
+			if (len > 0)
+				domain_len_cache = len;
 		}
+		domain_built = true;
+	}
+
+	if (domain_len_cache > 0) {
+		memcpy(domain.name, domain_name_cache, domain_len_cache);
+		domain.len = htons((int)domain_len_cache);
+		domain_len = domain_len_cache + 4;
 	}
 
 	uint8_t pdbuf[512];
@@ -244,19 +260,25 @@ static void handle_client_request(void *addr, void *data, size_t len, struct rel
 
 	if (opts[-4] != DHCPV6_MSG_INFORMATION_REQUEST) {
 		iov[4].iov_len = dhcpv6_handle_ia(pdbuf, sizeof(pdbuf), iface, addr, &opts[-4], opts_end);
-		if (iov[4].iov_len == 0 && opts[-4] == DHCPV6_MSG_REBIND)
+		// REBIND: silence-on-nothing-usable was already the rule here.
+		// RENEW: extended to match -- dhcpv6_handle_ia() now stays
+		// silent per-IA when nothing usable is available (e.g. right
+		// after a delegated-prefix change, before the new one lands),
+		// specifically so the client sees an unanswered Renew rather
+		// than a "successful" Reply with a status code, since that's
+		// what actually makes it drop the stale routes promptly.
+		if (iov[4].iov_len == 0 && (opts[-4] == DHCPV6_MSG_REBIND || opts[-4] == DHCPV6_MSG_RENEW))
 			return;
 	}
 
+	// No explicit DNS server configured (config->dnsaddr unspecified) --
+	// don't fall back to advertising this interface's own address as a
+	// "DNS server" (nothing is actually listening there), just omit the
+	// OPTION_DNS_SERVERS option entirely so the client falls back to
+	// whatever other DNS source it has (RA/manual/etc).
 	if (!IN6_IS_ADDR_UNSPECIFIED(&config->dnsaddr)) {
 		dnsaddr.addr = config->dnsaddr;
 		iov[2].iov_len = sizeof(dnsaddr);
-	} else {
-		struct relayd_ipaddr ipaddr;
-		if (relayd_get_interface_addresses(iface->ifindex, &ipaddr, 1) == 1) {
-			dnsaddr.addr = ipaddr.addr;
-			iov[2].iov_len = sizeof(dnsaddr);
-		}
 	}
 
 	if (iov[0].iov_len > 0) // Update length
