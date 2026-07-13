@@ -45,6 +45,16 @@ struct icmpv6_opt {
 #define MaxValidTime 7200
 #define MaxPreferredTime (3 * MaxRtrAdvInterval)
 
+// RFC 4861 §6.2.6: a solicited RA MUST be delayed by a random time
+// between 0 and MAX_RA_DELAY_TIME (in ms) to avoid multiple routers
+// answering a Router Solicitation in lockstep. In addition, consecutive
+// solicited (multicast) RAs on the same interface MUST NOT be sent more
+// often than once every MIN_DELAY_BETWEEN_RAS (in s) -- if a Solicit
+// arrives sooner than that after the previous RA, the response must be
+// pushed out to satisfy the minimum spacing instead of being dropped.
+#define MAX_RA_DELAY_TIME 500
+#define MIN_DELAY_BETWEEN_RAS 3
+
 #define ND_RA_FLAG_PROXY 0x4
 #define ND_RA_PREF_HIGH (1 << 3)
 #define ND_RA_PREF_LOW (3 << 3)

@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <syslog.h>
+#include <time.h>
 
 #include "list.h"
 
@@ -76,6 +77,13 @@ struct relayd_interface {
 	bool external;
 
 	struct relayd_event timer_rs;
+
+	// monotonic_time() of the last RA actually transmitted on this
+	// interface (solicited or periodic). Used to enforce the
+	// MIN_DELAY_BETWEEN_RAS spacing between solicited RAs required by
+	// RFC 4861 §6.2.6 -- see schedule_solicited_advert() in router.c.
+	// Zero means "never sent yet" (no rate-limit applies to the first one).
+	time_t ra_last_sent;
 
 	// IPv6 PD
 	struct list_head pd_assignments;

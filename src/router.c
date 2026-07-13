@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "6relayd.h"
@@ -33,6 +34,7 @@ static int open_icmpv6_socket(struct icmp6_filter *filt, struct ipv6_mreq *slave
 
 static void handle_icmpv6(void *addr, void *data, size_t len, struct relayd_interface *iface);
 static void send_router_advert(struct relayd_event *event);
+static void schedule_solicited_advert(struct relayd_interface *iface);
 static void sigusr1_refresh(int signal);
 
 static struct relayd_event router_discovery_event = {-1, NULL, handle_icmpv6};
@@ -190,12 +192,56 @@ static int open_icmpv6_socket(struct icmp6_filter *filt, struct ipv6_mreq *slave
 	return sock;
 }
 
+static time_t monotonic_time(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
+// RFC 4861 §6.2.6: delay a solicited RA by a random 0..MAX_RA_DELAY_TIME
+// (ms) to avoid several routers on the segment answering a Solicit in
+// lockstep, and additionally make sure consecutive solicited RAs on the
+// same interface are never sent less than MIN_DELAY_BETWEEN_RAS (s) apart
+// -- if the previous RA (solicited or periodic) went out more recently
+// than that, push the response out instead of sending it immediately.
+//
+// This reuses the same per-interface timerfd that the periodic
+// unsolicited RA is scheduled on (iface->timer_rs): a Solicit only ever
+// needs to make that timer fire *sooner*, never later, so if it's
+// already armed for an earlier time than what this RS would require
+// (e.g. the periodic RA was about to fire anyway), the existing timer is
+// left alone.
+static void schedule_solicited_advert(struct relayd_interface *iface) {
+	uint32_t jitter_ms;
+	relayd_urandom(&jitter_ms, sizeof(jitter_ms));
+	jitter_ms %= (MAX_RA_DELAY_TIME + 1); // 0..MAX_RA_DELAY_TIME inclusive
+
+	struct timespec delay = {0, (long)jitter_ms * 1000000L};
+
+	time_t now = monotonic_time();
+	time_t min_allowed = iface->ra_last_sent + MIN_DELAY_BETWEEN_RAS;
+	if (iface->ra_last_sent != 0 && min_allowed > now)
+		delay.tv_sec += min_allowed - now;
+
+	struct itimerspec cur;
+	if (!timerfd_gettime(iface->timer_rs.socket, &cur) && (cur.it_value.tv_sec != 0 || cur.it_value.tv_nsec != 0) &&
+		(cur.it_value.tv_sec < delay.tv_sec || (cur.it_value.tv_sec == delay.tv_sec && cur.it_value.tv_nsec <= delay.tv_nsec))) {
+		// A timer is already armed to fire at least as soon as what this
+		// Solicit would require (typically the periodic unsolicited RA) --
+		// leave it alone rather than pushing it out.
+		return;
+	}
+
+	struct itimerspec val = {{0, 0}, delay};
+	timerfd_settime(iface->timer_rs.socket, 0, &val, NULL);
+}
+
 // Event handler for incoming ICMPv6 packets
 static void handle_icmpv6(_unused void *addr, void *data, size_t len, struct relayd_interface *iface) {
 	struct icmp6_hdr *hdr = data;
 	if (config->enable_router_discovery_server) { // Server mode
 		if (hdr->icmp6_type == ND_ROUTER_SOLICIT && iface != &config->master)
-			send_router_advert(&iface->timer_rs);
+			schedule_solicited_advert(iface);
 	} else { // Relay mode
 		if (hdr->icmp6_type == ND_ROUTER_ADVERT && iface == &config->master)
 			forward_router_advertisement(data, len);
@@ -409,6 +455,7 @@ static void send_router_advert(struct relayd_event *event) {
 	struct iovec iov[] = {{&adv, (uint8_t *)&adv.prefix[cnt] - (uint8_t *)&adv}, {&routes, routes_cnt * sizeof(*routes)}};
 	struct sockaddr_in6 all_nodes = {AF_INET6, 0, 0, ALL_IPV6_NODES, 0};
 	relayd_forward_packet(router_discovery_event.socket, &all_nodes, iov, 2, iface);
+	iface->ra_last_sent = monotonic_time();
 
 	// Rearm timer
 	struct itimerspec val = {{0, 0}, {0, 0}};
