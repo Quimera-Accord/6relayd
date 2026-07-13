@@ -1135,6 +1135,71 @@ static size_t append_invalidate_reply(
 	return datalen;
 }
 
+// RFC 8415 §18.3.3: for a Confirm, the server checks every address in
+// every IA_NA the client included (IA_PD is irrelevant here -- a client
+// only ever Confirms addresses, never delegated prefixes, see §18.2.3)
+// against the prefix(es) it currently knows to be on-link for this
+// interface. If ALL addresses check out, status is Success; if ANY does
+// not, status is NotOnLink. Either way this is a SINGLE top-level Status
+// Code option in the Reply -- unlike every other message type handled by
+// this file, there is no per-IA status and the IA options themselves are
+// not echoed back at all.
+//
+// If the server cannot perform the check (no on-link prefix currently
+// known for this interface, e.g. mid delegation change) or the Confirm
+// contained no addresses in any IA_NA, the RFC requires the server to
+// not reply at all -- signaled here by returning 0, same convention
+// dhcpv6_handle_ia() already uses elsewhere to suppress a Reply.
+static size_t handle_confirm(struct relayd_interface *iface, const uint8_t *start, const uint8_t *end, uint8_t *buf, size_t buflen, time_t now) {
+	bool have_addr = false, all_on_link = true;
+
+	uint16_t otype, olen;
+	uint8_t *odata;
+	dhcpv6_for_each_option(start, end, otype, olen, odata) {
+		if (otype != DHCPV6_OPT_IA_NA)
+			continue; // Confirm only ever concerns IA_NA addresses
+
+		uint16_t stype, slen;
+		uint8_t *sdata;
+		dhcpv6_for_each_option(odata + sizeof(struct dhcpv6_ia_hdr) - 4, odata + olen, stype, slen, sdata) {
+			if (stype != DHCPV6_OPT_IA_ADDR || slen < sizeof(struct dhcpv6_ia_addr) - 4)
+				continue;
+
+			struct dhcpv6_ia_addr *a = (struct dhcpv6_ia_addr *)&sdata[-4];
+			have_addr = true;
+
+			bool on_link = false;
+			for (size_t i = 0; i < iface->pd_addr_len; ++i) {
+				if (iface->pd_addr[i].prefix > 64 || iface->pd_addr[i].valid <= (uint32_t)now)
+					continue;
+
+				if (iface->pd_addr[i].addr.s6_addr32[0] == a->addr.s6_addr32[0] && iface->pd_addr[i].addr.s6_addr32[1] == a->addr.s6_addr32[1]) {
+					on_link = true;
+					break;
+				}
+			}
+
+			if (!on_link)
+				all_on_link = false;
+		}
+	}
+
+	if (!have_addr || iface->pd_addr_len == 0)
+		return 0; // can't determine, or nothing to confirm -- MUST NOT reply
+
+	struct __attribute__((packed)) {
+		uint16_t type;
+		uint16_t len;
+		uint16_t value;
+	} stat = {htons(DHCPV6_OPT_STATUS), htons(sizeof(stat) - 4), htons(all_on_link ? DHCPV6_STATUS_OK : DHCPV6_STATUS_NOTONLINK)};
+
+	if (buflen < sizeof(stat))
+		return 0;
+
+	memcpy(buf, &stat, sizeof(stat));
+	return sizeof(stat);
+}
+
 size_t dhcpv6_handle_ia(uint8_t *buf, size_t buflen, struct relayd_interface *iface, const struct sockaddr_in6 *addr, const void *data, const uint8_t *end) {
 	time_t now = monotonic_time();
 	size_t response_len = 0;
@@ -1173,6 +1238,12 @@ size_t dhcpv6_handle_ia(uint8_t *buf, size_t buflen, struct relayd_interface *if
 		goto out;
 
 	update(iface);
+
+	if (hdr->msg_type == DHCPV6_MSG_CONFIRM) {
+		response_len = handle_confirm(iface, start, end, buf, buflen, now);
+		goto out;
+	}
+
 	bool update_state = false;
 
 	struct assignment *first = NULL;
@@ -1345,10 +1416,6 @@ size_t dhcpv6_handle_ia(uint8_t *buf, size_t buflen, struct relayd_interface *if
 				a->valid_until = now + 3600; // Block address for 1h
 				update_state = true;
 			}
-		} else if (hdr->msg_type == DHCPV6_MSG_CONFIRM) {
-			// Always send NOTONLINK for CONFIRM so that clients restart connection
-			status = DHCPV6_STATUS_NOTONLINK;
-			ia_response_len = append_reply(buf, buflen, status, ia, a, iface, true);
 		}
 
 		buf += ia_response_len;
